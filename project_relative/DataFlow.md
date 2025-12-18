@@ -271,3 +271,235 @@ prompt = """
         {', '.join([f'User query: {query}' for query in queries])}
         """
 ```
+
+
+##  reasoning_general_pipeline.py
+
+```mermaid
+graph TD
+    Start([开始: 加载初始数据]) --> Step1
+    
+    subgraph DataProcessing [数据构建流水线]
+        direction TB
+        
+        Step1[步骤 1: 问题筛选<br/>ReasoningQuestionFilter]
+        Step1 -->|筛选高质量指令| Step2
+        
+        Step2[步骤 2: 问题合成<br/>ReasoningQuestionGenerator]
+        Step2 -->|合成新的推理问题| Step3
+        
+        Step3[步骤 3: 答案生成<br/>ReasoningAnswerGenerator]
+        Step3 -->|生成推理过程 CoT| Step4
+        
+        Step4[步骤 4: 模型评估<br/>ReasoningAnswerModelJudgeFilter]
+        Step4 -->|评估答案质量| Step5
+        
+        Step5[步骤 5: N-gram 过滤<br/>ReasoningAnswerNgramFilter]
+    end
+    
+    Step5 --> End([结束: 输出最终数据])
+
+    %% 样式设置
+    style Start fill:#f9f,stroke:#333,stroke-width:2px
+    style End fill:#f9f,stroke:#333,stroke-width:2px
+    style Step1 fill:#e1f5fe,stroke:#01579b
+    style Step2 fill:#e1f5fe,stroke:#01579b
+    style Step3 fill:#fff9c4,stroke:#fbc02d
+    style Step4 fill:#e1f5fe,stroke:#01579b
+    style Step5 fill:#e1f5fe,stroke:#01579b
+```
+
+####  流程详细说明：
+1. 数据加载 ：从 pipeline_general.json 加载初始数据。
+2. 步骤 1 (问题筛选) ：使用模型对输入的指令（Instruction）进行质量评估和筛选，保留高质量的种子问题。
+3. 步骤 2 (问题合成) ：基于筛选后的种子问题，使用模型合成新的、可能更复杂的推理问题。
+4. 步骤 3 (答案生成) ：调用大模型（DeepSeek）为合成的问题生成详细的推理过程（Chain of Thought, CoT）。
+5. 步骤 4 (模型评估) ：使用模型作为裁判（Judge），对生成的 CoT 答案进行质量打分和评估（可能会参考 Golden Answer）。
+6. 步骤 5 (N-gram 过滤) ：使用 N-gram 算法对生成的文本进行统计特征过滤（如去重、过滤重复片段等），确保数据多样性。
+7. 输出 ：最终得到经过清洗、生成和验证的高质量推理数据集。
+
+#### prompt: 问题质量评估 ; aim: 找到那些真的需要推理的任务
+
+```python 
+prompt = f"""你现在负责一项推理任务的审核工作。请按顺序执行以下四个步骤，并在遇到第一个错误时停止：
+
+0. **初步验证**：验证输入是否仅包含一个清晰的推理任务（不得包含“改写”、“翻译”或“提供答案”等额外指令）；如果不符合，输出 judgement_test=false。
+1. **格式检查**：检查拼写、语法和格式（例如代码缩进、LaTeX 公式、Markdown 语法），此步骤无需解读语义。
+2. **前提验证**：针对每一个最小前提（即不可再分解的推论基础），验证其是否违反常识、领域事实或任务要求（例如，“半个人”是无效的；除非有明确假设，否则不允许魔法操作）；如果前提无效，则判定失败。
+3. **逻辑一致性检查**：检查前提之间或推理过程中是否存在矛盾，或者最终结果是否明显不合理、不可解；若是，则判定失败。
+4. **完整性检查**：如果以上步骤均通过，检查是否有足够的信息来完成该任务；缺少必要条件则判定失败，冗余细节是可以接受的。
+
+完成上述步骤后，请严格按以下格式输出：
+{{
+    "judgement_test": true/false,
+    "error_type": "<错误描述或 null>"
+}}
+你可以包含你的思考过程，但最终输出必须是上述 JSON 格式。
+
+以下是待评估的内容：
+-------------------------------
+{question}
+-------------------------------
+"""
+```
+
+## kbcleaning_pipeline
+
+```mermaid
+graph TD
+    Start([开始]) --> Input["读取输入数据<br/>(FileStorage: kbc_test.jsonl)"]
+    
+    subgraph Data_Preprocessing [数据预处理阶段]
+        Input --> Step1["步骤 1: 格式转换<br/>FileOrURLToMarkdownConverterBatch"]
+        Step1 -- 转换为 Markdown --> Step2["步骤 2: 文本切分<br/>KBCChunkGenerator"]
+        Step2 -- 按 512 Token 切分 --> Chunks[文本块 Chunks]
+    end
+
+    subgraph LLM_Processing [LLM 处理阶段 vLLM]
+        InitLLM["初始化本地 LLM 服务<br/>Model: Qwen/Qwen2.5-7B-Instruct"] -. 提供服务 .-> Step3
+        InitLLM -. 提供服务 .-> Step4
+        
+        Chunks --> Step3["步骤 3: 文本清洗<br/>KBCTextCleaner"]
+        Step3 -- 清洗后的文本 --> Step4["步骤 4: 多跳 QA 生成<br/>Text2MultiHopQAGenerator"]
+    end
+
+    Step4 --> Output[输出最终数据]
+    Output --> End([结束])
+
+    style Start fill:#f9f,stroke:#333,stroke-width:2px
+    style End fill:#f9f,stroke:#333,stroke-width:2px
+    style InitLLM fill:#e1f5fe,stroke:#01579b
+```
+
+####  详细步骤说明
+- 输入 (Input) :
+
+- 从指定路径 ( ../example_data/KBCleaningPipeline/kbc_test.jsonl ) 读取初始数据条目。
+- 步骤 1: 格式转换 (FileOrURLToMarkdownConverterBatch) :
+
+- 功能 : 将输入的文件或 URL 内容批量转换为 Markdown 格式。
+- 特点 : 使用 vlm-vllm-engine 作为后端处理引擎。
+- 步骤 2: 文本切分 (KBCChunkGenerator) :
+
+- 功能 : 将 Markdown 文本切分为较小的文本块。
+- 配置 : 使用 Token 方式切分，每个块大小为 512 个 Token，使用 Qwen/Qwen2.5-7B-Instruct 的 tokenizer。
+- LLM 服务初始化 (LocalModelLLMServing_vllm) :
+
+- 功能 : 启动本地大模型服务，供后续步骤调用。
+- 配置 : 加载 Qwen/Qwen2.5-7B-Instruct 模型，使用 vLLM 推理加速（配置了 4 卡张量并行）。
+- 步骤 3: 文本清洗 (KBCTextCleaner) :
+
+- 功能 : 调用 LLM 对切分后的文本块进行清洗，修正错误或去除无关内容。
+- 步骤 4: 多跳 QA 生成 (Text2MultiHopQAGenerator) :
+
+- 功能 : 调用 LLM 基于清洗后的文本生成多跳（Multi-hop）问答对。
+- 配置 : 每个文本块生成 5 个问题。
+- 输出 (Output) :
+
+- 流程结束，生成包含清洗后文本及对应问答对的数据。
+
+#### prompt: 生成多个事实相关的QA
+```
+"""\
+                您是专业的多跳问答生成专家，必须严格遵循以下专业标准：
+
+                █ 核心要求
+                1. 必须识别上下文中的2-3个关联事实
+                2. 设计需要跨事实推理的复杂问题
+                3. 推理链必须满足：
+                    - 至少包含2-3个逻辑步骤
+                    - 每个步骤明确标注序号
+                    - 步骤间存在因果或递进关系
+                4. 最终答案必须整合所有推理结论
+                5. 只关注正文内容，避免根据链接、参考文献等附加信息合成问答。
+                
+                █ 输出规范
+                6. 仅允许输出以下结构的纯JSON：
+                {
+                    "question": "需要跨事实推理的问题",
+                    "reasoning_steps": [
+                        {"step": "第一推理步骤（必须引用事实1）"},
+                        {"step": "第二推理步骤（必须关联事实2）"}
+                    ],
+                    "answer": "整合所有步骤的最终答案",
+                    "supporting_facts": ["原文事实1", "原文事实2"],
+                    "type": "领域标签"
+                }
+                7. 支撑事实必须：
+                    - 从上下文逐字提取
+                    - 与推理步骤严格对应
+                    - 不得改写或概括
+
+                █ 示例
+                上下文：
+                "量子纠缠现象由爱因斯坦提出质疑。后来贝尔实验证实了其真实性。该现象是量子计算的基础。"
+
+                合格输出：
+                {
+                    "question": "为什么量子纠缠现象对量子计算很重要？",
+                    "reasoning_steps": [
+                        {"step": "贝尔实验证实了量子纠缠的真实性"},
+                        {"step": "该现象是量子计算的基础"}
+                    ],
+                    "answer": "因为量子纠缠被证实真实且是量子计算的基础",
+                    "supporting_facts": [
+                        "后来贝尔实验证实了其真实性",
+                        "该现象是量子计算的基础"
+                    ],
+                    "type": "量子物理"
+                }
+
+                █ 违规处理
+                以下情况将拒绝输出：
+                - 推理步骤少于2步
+                - 存在未引用的支撑事实
+                - JSON外出现任何附加文本
+                """
+```
+
+## quick_evaluate.py
+
+```mermaid
+graph TD
+    A[开始] --> B[初始化Pipeline]
+    B --> C[加载输入数据<br/>pt_input.jsonl]
+    C --> D[初始化LLM服务<br/>DeepSeek API]
+    D --> E[初始化MetaSampleEvaluator<br/>6维度评估器]
+    E --> F[执行评估流程]
+    
+    F --> G[读取文本数据]
+    G --> H[构建评估提示词]
+    H --> I[调用LLM API评估]
+    I --> J[解析评估结果]
+    J --> K[生成6维度评分]
+    
+    K --> L[输出评估结果]
+    L --> M[结束]
+    
+    subgraph "评估维度"
+        N1[文本结构<br/>Text Structure]
+        N2[多样性与复杂度<br/>Diversity & Complexity]
+        N3[流畅性与可理解性<br/>Fluency & Understandability]
+        N4[安全性<br/>Safety]
+        N5[教育价值<br/>Educational Value]
+        N6[内容准确性<br/>Content Accuracy]
+    end
+    
+    J --> N1
+    J --> N2
+    J --> N3
+    J --> N4
+    J --> N5
+    J --> N6
+```
+
+#### 评估维度
+
+每个文本会从以下6个维度获得1-5分的评分：
+
+1. 文本结构 (Text Structure) : 拼写、语法、词汇丰富度、句子结构
+2. 多样性与复杂度 (Diversity & Complexity) : 内容丰富度和概念多样性
+3. 流畅性与可理解性 (Fluency & Understandability) : 文本流畅度和易读性
+4. 安全性 (Safety) : 是否包含不当内容、脏话或PII信息
+5. 教育价值 (Educational Value) : 是否提供见解、启发思考或学习价值
+6. 内容准确性 (Content Accuracy) : 真实性、相关性和实用性
